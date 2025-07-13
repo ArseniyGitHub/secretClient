@@ -489,12 +489,12 @@ public:
         
         {
             std::lock_guard<std::mutex> lock(client.output.getMutex());
-            for (auto& chunk : chunked) {
+            for (size_t i = 0; i < chunked.size(); i++) {
                 json req = {
                     {"action", "sendfile"},
-                    {"message", chunk},
+                    {"message", chunked[i]},
                     {"path", endpath},
-                    {"isFinal", (chunked.end()._Ptr == &chunk)}
+                    {"isfinal", (i + 1 == chunked.size())}
                 };
                 client.output.getQueue().push(req.dump());
             }
@@ -514,7 +514,8 @@ public:
         {"exit",     exit},
         {"cmd",      cmd},
         {"clients",  clients},
-        {"recv",     recvfile}
+        {"recv",     recvfile},
+        {"send",     sendfile}
     };
 
     void processCommand(const std::string& cmd) {
@@ -533,12 +534,6 @@ public:
 
 int main() {
 
-    auto file = chunkedFile("file.txt");
-    for (auto& e : file)
-        std::cout << std::string(e.data(), e.size());
-    
-
-    return 0;
     //   запускаем сервер
     Server* server = new Server(8080, clientHandler);
     size_t selected = 0;
